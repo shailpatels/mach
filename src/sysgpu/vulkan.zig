@@ -977,6 +977,9 @@ pub const SwapChain = struct {
     texture_index: u32 = 0,
     current_texture_view: ?*TextureView = null,
     format: sysgpu.Texture.Format,
+    surface: *Surface,
+    desc: sysgpu.SwapChain.Descriptor,
+    is_recreating: bool = false,
 
     pub fn init(device: *Device, surface: *Surface, desc: *const sysgpu.SwapChain.Descriptor) !*SwapChain {
         const vk_device = device.vk_device;
@@ -1035,6 +1038,7 @@ pub const SwapChain = struct {
             .composite_alpha = composite_alpha,
             .present_mode = present_mode,
             .clipped = vk.FALSE,
+            .old_swapchain = .null_handle,
         }, null);
 
         const fence = try vkd.createFence(vk_device, &.{ .flags = .{ .signaled_bit = false } }, null);
@@ -1075,6 +1079,8 @@ pub const SwapChain = struct {
             .textures = textures,
             .texture_views = texture_views,
             .format = desc.format,
+            .surface = surface,
+            .desc = desc.*,
         };
 
         return sc;
@@ -1104,13 +1110,34 @@ pub const SwapChain = struct {
             return view;
         }
 
-        const result = try vkd.acquireNextImageKHR(
-            vk_device,
-            sc.vk_swapchain,
-            std.math.maxInt(u64),
-            if (use_semaphore_wait) sc.wait_semaphore else .null_handle,
-            if (!use_semaphore_wait) sc.fence else .null_handle,
-        );
+        const semaphore_wait = if (use_semaphore_wait) sc.wait_semaphore else .null_handle;
+        const swapchain_fence = if (!use_semaphore_wait) sc.fence else .null_handle;
+
+        const result = blk: {
+            const image_result = vkd.acquireNextImageKHR(
+                vk_device,
+                sc.vk_swapchain,
+                std.math.maxInt(u64),
+                semaphore_wait,
+                swapchain_fence,
+            ) catch |err| switch (err) {
+                error.OutOfDateKHR => {
+                    log.info("Recreating swapchain! (getCurrentTextureView)", .{});
+                    //recreate the swapchain and attempt to acquire the next image index
+                    try sc.recreate();
+                    break :blk try vkd.acquireNextImageKHR(
+                        vk_device,
+                        sc.vk_swapchain,
+                        std.math.maxInt(u64),
+                        semaphore_wait,
+                        swapchain_fence,
+                    );
+                },
+                else => return err,
+            };
+
+            break :blk image_result;
+        };
 
         // Wait on the CPU so that GPU does not stall later during present.
         // This should be similar to using DXGI Waitable Object.
@@ -1121,9 +1148,9 @@ pub const SwapChain = struct {
 
         sc.texture_index = result.image_index;
         var view = sc.texture_views[sc.texture_index];
-        view.manager.reference();
         sc.current_texture_view = view;
 
+        view.manager.reference();
         return view;
     }
 
@@ -1135,15 +1162,140 @@ pub const SwapChain = struct {
         try queue.signal_semaphores.append(allocator, semaphore);
         try queue.flush();
 
-        _ = try vkd.queuePresentKHR(vk_queue, &.{
+        _ = vkd.queuePresentKHR(vk_queue, &.{
             .wait_semaphore_count = 1,
             .p_wait_semaphores = &[_]vk.Semaphore{semaphore},
             .swapchain_count = 1,
             .p_swapchains = &[_]vk.SwapchainKHR{sc.vk_swapchain},
             .p_image_indices = &[_]u32{sc.texture_index},
-        });
+        }) catch |err| switch (err) {
+            error.OutOfDateKHR => {
+                log.info("Recreating swapchain (present)!", .{});
+                try sc.recreate();
+
+                sc.current_texture_view = null;
+                return;
+            },
+            else => return err,
+        };
 
         sc.current_texture_view = null;
+    }
+
+    fn recreate(sc: *SwapChain) !void {
+        if (sc.is_recreating) return;
+
+        log.info("{d}x{d}", .{ sc.desc.width, sc.desc.height });
+
+        sc.is_recreating = true;
+        defer sc.is_recreating = false;
+
+        try vkd.deviceWaitIdle(sc.device.vk_device);
+
+        const vk_device = sc.device.vk_device;
+        const old_swapchain = sc.vk_swapchain;
+
+        const image_usage = conv.vulkanImageUsageFlags(sc.desc.usage, sc.desc.format);
+        const present_mode = conv.vulkanPresentMode(sc.desc.present_mode);
+
+        const capabilities = try vki.getPhysicalDeviceSurfaceCapabilitiesKHR(
+            sc.device.adapter.physical_device,
+            sc.surface.vk_surface,
+        );
+
+        const extent = vk.Extent2D{
+            .width = std.math.clamp(
+                sc.desc.width,
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            .height = std.math.clamp(
+                sc.desc.height,
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
+        };
+
+        const composite_alpha = blk: {
+            const composite_alpha_flags = [_]vk.CompositeAlphaFlagsKHR{
+                .{ .opaque_bit_khr = true },
+                .{ .pre_multiplied_bit_khr = true },
+                .{ .post_multiplied_bit_khr = true },
+                .{ .inherit_bit_khr = true },
+            };
+            for (composite_alpha_flags) |flag| {
+                if (@as(vk.Flags, @bitCast(flag)) & @as(vk.Flags, @bitCast(capabilities.supported_composite_alpha)) != 0) {
+                    break :blk flag;
+                }
+            }
+            break :blk vk.CompositeAlphaFlagsKHR{ .opaque_bit_khr = true };
+        };
+
+        const format = conv.vulkanFormat(sc.device, sc.desc.format);
+        const image_count = @max(capabilities.min_image_count + 1, capabilities.max_image_count);
+
+        // Create new swapchain
+        sc.vk_swapchain = try vkd.createSwapchainKHR(vk_device, &.{
+            .surface = sc.surface.vk_surface,
+            .min_image_count = image_count,
+            .image_format = format,
+            .image_color_space = .srgb_nonlinear_khr,
+            .image_extent = extent,
+            .image_array_layers = 1,
+            .image_usage = image_usage,
+            .image_sharing_mode = .exclusive,
+            .pre_transform = capabilities.current_transform,
+            .composite_alpha = composite_alpha,
+            .present_mode = present_mode,
+            .clipped = vk.FALSE,
+            .old_swapchain = old_swapchain,
+        }, null);
+
+        // Clean up old resources
+        for (sc.textures) |texture| {
+            texture.deinit();
+        }
+
+        for (sc.texture_views) |view| {
+            view.deinit();
+        }
+
+        allocator.free(sc.textures);
+        allocator.free(sc.texture_views);
+
+        // Get new swapchain images
+        var images_len: u32 = 0;
+        _ = try vkd.getSwapchainImagesKHR(vk_device, sc.vk_swapchain, &images_len, null);
+        const images = try allocator.alloc(vk.Image, images_len);
+        defer allocator.free(images);
+        _ = try vkd.getSwapchainImagesKHR(vk_device, sc.vk_swapchain, &images_len, images.ptr);
+
+        // Create new textures and views
+        const textures = try allocator.alloc(*Texture, images_len);
+        const texture_views = try allocator.alloc(*TextureView, images_len);
+
+        for (0..images_len) |i| {
+            const texture = try Texture.initForSwapChain(sc.device, &sc.desc, images[i], sc);
+            textures[i] = texture;
+            texture_views[i] = try texture.createView(&.{
+                .format = sc.desc.format,
+                .dimension = .dimension_2d,
+            });
+        }
+
+        sc.textures = textures;
+        sc.texture_views = texture_views;
+        sc.texture_index = 0;
+        sc.current_texture_view = null;
+
+        if (!use_semaphore_wait) {
+            try vkd.resetFences(sc.device.vk_device, 1, &[_]vk.Fence{sc.fence});
+        }
+
+        // Destroy old swapchain after new resources are set up
+        if (old_swapchain != .null_handle) {
+            vkd.destroySwapchainKHR(vk_device, old_swapchain, null);
+        }
     }
 };
 
@@ -1187,7 +1339,6 @@ pub const Buffer = struct {
             break :blk .linear;
         };
         const mem_type_index = device.memory_allocator.findBestAllocator(requirements, mem_type) orelse @panic("unimplemented"); // TODO
-
         const memory = try vkd.allocateMemory(vk_device, &.{
             .allocation_size = requirements.size,
             .memory_type_index = mem_type_index,
@@ -3548,59 +3699,42 @@ const MemoryAllocator = struct {
         mem_kind: MemoryKind,
     ) ?u32 {
         const mem_types = mem_alloc.info.memory_types[0..mem_alloc.info.memory_type_count];
-        const mem_heaps = mem_alloc.info.memory_heaps[0..mem_alloc.info.memory_heap_count];
+        //const mem_heaps = mem_alloc.info.memory_heaps[0..mem_alloc.info.memory_heap_count];
 
-        var best_type: ?u32 = null;
+        //todo instead pass in the mem_type to get back the required flags
+        const property_flags = getMemoryPropertyFlags(mem_kind);
+
         for (mem_types, 0..) |mem_type, i| {
-            if (requirements.memory_type_bits & (@as(u32, @intCast(1)) << @intCast(i)) == 0) continue;
+            const is_compatible = (requirements.memory_type_bits & (@as(u32, 1) << @truncate(i))) != 0;
+            if (!is_compatible) continue;
 
             const flags = mem_type.property_flags;
-            const heap_size = mem_heaps[mem_type.heap_index].size;
-            const candidate = switch (mem_kind) {
-                .lazily_allocated => flags.lazily_allocated_bit,
-                .linear_write_mappable => flags.host_visible_bit and flags.host_coherent_bit and !flags.device_coherent_bit_amd,
-                .linear_read_mappable => blk: {
-                    if (flags.host_visible_bit and flags.host_coherent_bit and !flags.device_coherent_bit_amd) {
-                        if (best_type) |best| {
-                            if (mem_types[best].property_flags.host_cached_bit) {
-                                if (flags.host_cached_bit) {
-                                    const best_heap_size = mem_heaps[mem_types[best].heap_index].size;
-                                    if (heap_size > best_heap_size) {
-                                        break :blk true;
-                                    }
-                                }
+            //const heap_index = mem_type.heap_index;
+            // const heap_size = mem_heaps[heap_index].size;
 
-                                break :blk false;
-                            }
-                        }
+            if (flags != property_flags) continue;
+            //     log.info("-----", .{});
+            //    log.info("size: {}, index is {}", .{ heap_size, i });
+            //   log.info("GOT {}", .{flags});
+            //  log.info("REQ {}", .{property_flags});
+            //log.info("{s} -> {any} // {any}", .{ @tagName(mem_kind), property_flags, flags });
 
-                        break :blk true;
-                    }
-
-                    break :blk false;
-                },
-                .linear => blk: {
-                    if (best_type) |best| {
-                        if (mem_types[best].property_flags.device_local_bit) {
-                            if (flags.device_local_bit and !flags.device_coherent_bit_amd) {
-                                const best_heap_size = mem_heaps[mem_types[best].heap_index].size;
-                                if (heap_size > best_heap_size or flags.host_visible_bit) {
-                                    break :blk true;
-                                }
-                            }
-
-                            break :blk false;
-                        }
-                    }
-
-                    break :blk true;
-                },
-            };
-
-            if (candidate) best_type = @intCast(i);
+            return @intCast(i);
         }
 
-        return best_type;
+        return 0;
+    }
+
+    fn getMemoryPropertyFlags(mem_kind: MemoryKind) vk.MemoryPropertyFlags {
+        return switch (mem_kind) {
+            .lazily_allocated => vk.MemoryPropertyFlags{ .lazily_allocated_bit = true },
+            .linear => vk.MemoryPropertyFlags{ .device_local_bit = true },
+            .linear_read_mappable => vk.MemoryPropertyFlags{ .host_visible_bit = true },
+            .linear_write_mappable => vk.MemoryPropertyFlags{
+                .host_visible_bit = true,
+                .host_coherent_bit = true,
+            },
+        };
     }
 };
 
