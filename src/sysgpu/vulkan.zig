@@ -3709,15 +3709,7 @@ const MemoryAllocator = struct {
             if (!is_compatible) continue;
 
             const flags = mem_type.property_flags;
-            //const heap_index = mem_type.heap_index;
-            // const heap_size = mem_heaps[heap_index].size;
-
             if (flags != property_flags) continue;
-            //     log.info("-----", .{});
-            //    log.info("size: {}, index is {}", .{ heap_size, i });
-            //   log.info("GOT {}", .{flags});
-            //  log.info("REQ {}", .{property_flags});
-            //log.info("{s} -> {any} // {any}", .{ @tagName(mem_kind), property_flags, flags });
 
             return @intCast(i);
         }
